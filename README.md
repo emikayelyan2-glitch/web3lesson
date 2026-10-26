@@ -3,14 +3,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/tonoyandev/web3lesson/releases/latest"><img src="docs/download-mac.svg" alt="Download for Mac (Apple Silicon)" height="56"></a>
+  <a href="https://github.com/emikayelyan2-glitch/web3lesson/releases"><img src="docs/download-mac.svg" alt="Download for Mac (Apple Silicon)" height="56"></a>
   &nbsp;
-  <a href="https://github.com/tonoyandev/web3lesson/releases/latest"><img src="docs/download-windows.svg" alt="Download for Windows" height="56"></a>
+  <a href="https://github.com/emikayelyan2-glitch/web3lesson/releases"><img src="docs/download-windows.svg" alt="Download for Windows" height="56"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/tonoyandev/web3lesson/releases/latest"><img src="https://img.shields.io/github/v/release/tonoyandev/web3lesson?label=version&color=2dd4bf" alt="latest version"></a>
-  <a href="https://github.com/tonoyandev/web3lesson/actions/workflows/ci.yml"><img src="https://github.com/tonoyandev/web3lesson/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://github.com/emikayelyan2-glitch/web3lesson/releases"><img src="https://img.shields.io/github/v/release/emikayelyan2-glitch/web3lesson?label=version&color=2dd4bf&include_prereleases" alt="latest version"></a>
+  <a href="https://github.com/emikayelyan2-glitch/web3lesson/actions/workflows/ci.yml"><img src="https://github.com/emikayelyan2-glitch/web3lesson/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/runs-100%25%20locally-4ade80" alt="runs 100% locally">
   <img src="https://img.shields.io/badge/license-MIT-7c9cff" alt="MIT license">
 </p>
@@ -20,6 +20,8 @@
   anti-persona reads them on your own computer, picks a mix of interests that are not yours,<br>
   and blends them into your profile in small, natural steps, through NymVPN.
 </p>
+
+<p align="center"><sub>A version of <a href="https://github.com/tonoyandev/web3lesson">tonoyandev/web3lesson</a> that mixes in interests instead of drifting to an opposite, and runs through NymVPN.</sub></p>
 
 ---
 
@@ -107,7 +109,7 @@ and [NymVPN](https://nym.com/download), plus `nym-vpnc` (see above). Open Ollama
 once, so it keeps running in the background.
 
 **2. Download anti-persona** for your computer from the
-[latest release](https://github.com/tonoyandev/web3lesson/releases/latest), then unzip it.
+[latest release](https://github.com/emikayelyan2-glitch/web3lesson/releases), then unzip it.
 
 | Your computer | File |
 |---|---|
@@ -143,7 +145,7 @@ Your data is kept in `%APPDATA%\anti-persona`. Put `nym-vpnc.exe` there.
 You need Python 3.10 or newer, Google Chrome, Ollama and NymVPN.
 
 ```bash
-git clone https://github.com/tonoyandev/web3lesson.git anti-persona
+git clone https://github.com/emikayelyan2-glitch/web3lesson.git anti-persona
 cd anti-persona
 pip3 install -r requirements.txt
 ```
