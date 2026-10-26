@@ -26,12 +26,14 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 import webbrowser
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import anti
+import nym
 import persona
 
 ROOT = Path(__file__).resolve().parent
@@ -39,7 +41,8 @@ DATA = persona.DATA
 FROZEN = persona.FROZEN
 TOKEN = secrets.token_urlsafe(24)
 SERVER = None
-CHANNELS = ("google", "youtube", "chatgpt", "claude", "gemini")
+CHANNELS = ("google", "youtube", "chatgpt", "gemini")
+REPORTS = ("report.html", "mix.html")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,80}$")
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 WIN_TASK = "anti-persona"
@@ -127,6 +130,10 @@ def _ais(p):
     return ",".join(chosen) or "none"
 
 
+def _on(p, name):
+    return "on" if p.get(name) is True else "off"
+
+
 def build(action, p):
     """Button -> argument list. Whitelisted actions, validated values, never a shell."""
     a, pe = (lambda *x: persona.script_cmd("anti", *x)), (lambda *x: persona.script_cmd("persona", *x))
@@ -139,14 +146,15 @@ def build(action, p):
     if action == "research":
         return pe("--yes", "--model", _model(p)), None
     if action == "plan":
-        args = a("plan", "--model", _model(p), "--stages", str(_int(p, "stages", 3, 20, 10)),
-                 "--days-per-stage", str(_int(p, "days", 1, 30, anti.DAYS_PER_STAGE)))
-        goal = " ".join(str(p.get("goal") or "").split())[:300]
-        return args + ["--ais", _ais(p)] + (["--goal", goal] if goal else []), None
+        args = a("plan", "--model", _model(p), "--days-per-topic", str(_int(p, "days", 1, 30, anti.DAYS_PER_TOPIC)))
+        topics = " ".join(str(p.get("topics") or "").split())[:300]
+        return args + ["--ais", _ais(p)] + (["--topics", topics] if topics else []), None
     if action == "ais":
         return a("ais", "--set", _ais(p)), None
     if action == "pace":
-        return a("plan", "--check", "--days-per-stage", str(_int(p, "days", 1, 30, anti.DAYS_PER_STAGE))), None
+        return a("plan", "--check", "--days-per-topic", str(_int(p, "days", 1, 30, anti.DAYS_PER_TOPIC))), None
+    if action == "vpn":
+        return a("vpn", "--require", _on(p, "require"), "--auto-connect", _on(p, "auto")), None
     if action == "approve":
         return a("approve"), "y"  # the page showed the plan and the notice; the click is the "y"
     if action == "login":
@@ -195,6 +203,25 @@ def scheduled():
     return None
 
 
+_VPN = {"at": 0.0, "st": None}
+
+
+def vpn_status():
+    """nym-vpnc is a separate process: ask it at most every 10 s, not on every poll."""
+    if _VPN["st"] is None or time.time() - _VPN["at"] > 10:
+        _VPN.update(at=time.time(), st=nym.status())
+    return _VPN["st"]
+
+
+def suggested():
+    """Topic names the research suggested for the mix."""
+    try:
+        pj = json.loads((anti.OUT / "persona.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [t["name"] for t in anti.suggested(pj, quiet=True)]
+
+
 def sources():
     """Sizes walk big folders, so this is asked for once, not on every poll."""
     out = []
@@ -218,28 +245,33 @@ def status():
         "default_model": anti.MODEL,
         "embed_model": anti.EMBED,
         "research": (anti.OUT / "persona.json").exists(),
-        "reports": {n: (anti.OUT / n).exists() for n in ("report.html", "transition.html")},
+        "suggested": suggested(),
+        "reports": {n: (anti.OUT / n).exists() for n in REPORTS},
         "scheduled": scheduled(),
+        "vpn": {**vpn_status(), **anti.vpn_settings(), "howto": nym.HOWTO},
         "roadmap": None,
         "ais": {"found": anti.detected(), "chosen": anti.chosen_ais(), "all": list(anti.CHAT)},
     }
     if anti.ROADMAP_F.exists():
         try:
-            rm = json.loads(anti.ROADMAP_F.read_text())
+            rm = json.loads(anti.ROADMAP_F.read_text(encoding="utf-8"))
+            if "cards" not in rm:
+                raise KeyError("this plan comes from an older version; make a new one in step 2")
             r = anti.rid(rm)
             log = anti.read_log(r)
-            left = anti.open_slots(rm, log, anti.load_variants(), every=True)
-            total = len(anti.slots(rm))
+            n = anti.next_day(rm, log, anti.load_days())
             sc = rm.get("scores", {})
             s["roadmap"] = {
-                "id": r, "approved": anti.is_approved(rm), "days_per_stage": anti.days(rm), "ais": anti.assistants(rm),
-                "stages": [{"k": x["k"], "theme": x["theme"], "bridge": x["bridge"]} for x in rm["stages"]],
-                "scores": {k: sc.get(k) for k in ("pos", "min_cos", "cos_ends", "max_step", "step_limit", "backslides", "coverage", "valid")},
-                "days_done": total - len(left), "days_total": total,
-                "next": {"stage": left[0][0], "day": left[0][1], "due_in_h": round(anti.too_soon(log, *left[0]), 1)} if left else None,
+                "id": r, "approved": anti.is_approved(rm), "days_per_topic": anti.pace(rm), "ais": anti.assistants(rm),
+                "cards": [{"k": c["k"], "topic": c["topic"], "start": c.get("start", ""), "joins": anti.first_day(rm, c["k"])}
+                          for c in rm["cards"]],
+                "scores": {"away": sc.get("away"), "min_away": sc.get("min_away"), "min_apart": sc.get("min_apart"),
+                           "overlaps": len(sc.get("overlap") or []), "sensitive": sc.get("sensitive") or [], "valid": sc.get("valid")},
+                "days_run": len({x["day"] for x in log if isinstance(x.get("day"), int) and x.get("channel") != "vpn"}),
+                "next": {"day": n, "live": [c["topic"] for c in anti.live(rm, n)], "due_in_h": round(anti.too_soon(log, n), 1)},
             }
         except (ValueError, KeyError, OSError) as e:
-            s["roadmap_error"] = str(e)
+            s["roadmap_error"] = str(e).strip("'\"")
     return s
 
 
@@ -282,7 +314,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, sources())
         if u.path == "/api/job":
             return self._send(200, JOB.view(int((q.get("since") or ["0"])[0] or 0)))
-        if u.path in ("/report/report.html", "/report/transition.html"):
+        if u.path in tuple(f"/report/{n}" for n in REPORTS):
             f = anti.OUT / u.path.rsplit("/", 1)[1]
             return self._send(200, f.read_bytes(), "text/html; charset=utf-8") if f.exists() else self._send(404, {"error": "not made yet"})
         return self._send(404, {"error": "not found"})
@@ -299,6 +331,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/start":
                 args, stdin_text = build(str(p.get("action")), p)
                 JOB.start(str(p.get("action")), args, stdin_text)
+                if p.get("action") == "vpn":
+                    _VPN["st"] = None  # show the new setting on the next poll
             elif path == "/api/input":
                 JOB.send("")  # only ever "press Enter" (login finished)
             elif path == "/api/stop":
@@ -354,6 +388,7 @@ input[type=text]{flex:1;min-width:220px}input[type=number]{width:74px}
 label{display:inline-flex;gap:6px;align-items:center}
 ul.checks{list-style:none;padding:0;margin:0}ul.checks li{padding:4px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .y{color:var(--ok)}.n{color:var(--bad)}
+.chips span{display:inline-block;background:var(--chip);border-radius:999px;padding:2px 10px;margin:2px 4px 2px 0;font-size:13px}
 table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}td,th{padding:6px 8px;border-top:1px solid var(--line);text-align:left;vertical-align:top}
 .note{font-size:13px;color:var(--mut);margin-top:8px}.warnbox{border-left:3px solid var(--warn);padding:8px 12px;background:var(--chip);border-radius:6px;font-size:14px;margin-top:10px}
 .bar{height:8px;background:var(--chip);border-radius:99px;overflow:hidden;margin-top:8px}.bar>div{height:100%;background:var(--acc)}
@@ -364,12 +399,16 @@ table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}td,th{pa
 a{color:var(--acc)}
 </style></head><body><main>
 <div class="head"><h1>anti-persona</h1><button id="quit" style="margin-left:auto">Quit</button></div>
-<div class="mut">Go step by step. Each button runs one command; you can see it and its output at the bottom.</div>
+<div class="mut">Blur what trackers know about you: the app mixes interests that are not yours into your profile, one day at a time, through NymVPN. Each button runs one command; you can see it and its output at the bottom.</div>
 <div class="note" id="datanote"></div>
 
 <section class="card"><div class="head"><div class="num">0</div><h2>Get ready</h2><span class="badge" id="b0"></span></div>
 <div class="body"><ul class="checks" id="checks"></ul>
-<div class="row"><label>Model <select id="model"></select></label><span class="note" id="modelnote"></span></div></div></section>
+<div class="row"><label>Model <select id="model"></select></label><span class="note" id="modelnote"></span></div>
+<div class="row"><label><input type="checkbox" id="vpnreq"> Run only through NymVPN</label>
+<label><input type="checkbox" id="vpnauto"> turn it on for a run, and off again after</label>
+<button data-act="vpn" id="savevpn">Save</button></div>
+<div class="note" id="vpnnote"></div></div></section>
 
 <section class="card"><div class="head"><div class="num">1</div><h2>Learn who you are</h2><span class="badge" id="b1"></span></div>
 <div class="body"><div class="mut">The tool will read these files on this computer. It never changes them, and nothing is uploaded.</div>
@@ -378,14 +417,15 @@ a{color:var(--acc)}
 <div class="row"><button class="main" id="research" data-act="research">Start research</button>
 <button data-open="report.html" id="openreport">Open report</button><span class="note">Takes a few minutes.</span></div></div></section>
 
-<section class="card"><div class="head"><div class="num">2</div><h2>Make the plan</h2><span class="badge" id="b2"></span></div>
-<div class="body"><div><b>Which AIs should see the change?</b></div>
+<section class="card"><div class="head"><div class="num">2</div><h2>Pick the mix</h2><span class="badge" id="b2"></span></div>
+<div class="body"><div class="mut">Topics that are not yours. One joins every few days; once all have joined, every day mixes all of them until you stop it.</div>
+<div class="row"><b>Suggested by step 1:</b><span class="chips" id="suggested"></span></div>
+<div class="row"><input type="text" id="topics" placeholder="Or your own topics, comma-separated, e.g. cooking, football, history"></div>
+<div style="margin-top:14px"><b>Which AIs should see the mix?</b></div>
 <div class="mut">Found by step 1 on this computer. Google and YouTube are always part of the plan.</div>
 <ul class="checks" id="aichoice"></ul>
 <div class="row"><button data-act="ais" id="saveais">Save AI choice</button><span class="note" id="aisnote"></span></div>
-<div class="row"><input type="text" id="goal" placeholder="Optional goal, e.g. house plants, gardening, living in nature"></div>
-<div class="row"><label>Steps <input type="number" id="stages" value="10" min="3" max="20"></label>
-<label>Days per step <input type="number" id="days" value="5" min="1" max="30"></label>
+<div class="row"><label>Days before the next topic joins <input type="number" id="days" value="5" min="1" max="30"></label>
 <button class="main" data-act="plan" id="plan">Make plan</button>
 <button data-act="pace" id="pace">Change pace only</button></div>
 <div class="note">Making a plan is slow: about 20 minutes per attempt with the default model, up to 3 attempts.</div>
@@ -394,14 +434,15 @@ a{color:var(--acc)}
 <section class="card"><div class="head"><div class="num">3</div><h2>Approve the plan</h2><span class="badge" id="b3"></span></div>
 <div class="body"><div class="warnbox">Before you approve:<br>
 • Only use this on your own computer and your own accounts.<br>
-• ChatGPT, Claude and Gemini do not allow bots on their websites. Your accounts could be flagged. Choose which AIs take part in step 2, or none.<br>
-• If a site shows a CAPTCHA or a login page, the run stops. It never tries to get past it.<br>
-• Everything runs in a separate Chrome profile. Your normal Chrome is untouched.</div>
+• ChatGPT and Gemini do not allow bots on their websites. Your accounts could be flagged. Choose which AIs take part in step 2, or none.<br>
+• If a site shows a CAPTCHA or a login page, the run stops. It never tries to get past it. Through a VPN this happens more often.<br>
+• Runs go only through NymVPN, unless you turn that off in step 0. If NymVPN drops, the run stops.<br>
+• Everything runs in a separate Chrome profile. Your normal Chrome is untouched. The mix reaches your profile through the accounts you log in to in step 4.</div>
 <div class="row"><label><input type="checkbox" id="understood"> I read the plan above and the notes</label>
 <button class="main" data-act="approve" id="approve">Approve</button></div></div></section>
 
 <section class="card"><div class="head"><div class="num">4</div><h2>Log in once</h2><span class="badge" id="b4"></span></div>
-<div class="body"><div class="mut">A separate Chrome window opens. Log in to Google and to the AIs your plan uses (ChatGPT, Claude, Gemini) there yourself. The tool never sees your passwords.</div>
+<div class="body"><div class="mut">A separate Chrome window opens, through NymVPN. Log in to Google and to the AIs your plan uses (ChatGPT, Gemini) there yourself. The tool never sees your passwords.</div>
 <div class="row"><button class="main" data-act="login" id="login">Open login window</button>
 <button id="loggedin" disabled>I'm logged in, save it</button></div></div></section>
 
@@ -411,16 +452,16 @@ a{color:var(--acc)}
 <div class="row"><button data-act="preview" id="preview">Preview today</button>
 <button class="main" data-act="run" id="run">Run today</button>
 <label class="note"><input type="checkbox" id="force"> ignore the 12-hour wait</label></div>
-<div class="note">A day is 7–13 actions (5 searches, 2 videos, 2 questions per chosen AI) and takes 10–15 minutes. Chrome opens; you can watch.</div></div></section>
+<div class="note">A day is 7–11 actions (5 searches, 2 videos, 2 questions per chosen AI) and takes 10–15 minutes. Chrome opens; you can watch.</div></div></section>
 
-<section class="card"><div class="head"><div class="num">6</div><h2>See progress</h2><span class="badge" id="b6"></span></div>
+<section class="card"><div class="head"><div class="num">6</div><h2>See the mix</h2><span class="badge" id="b6"></span></div>
 <div class="body"><div class="row"><button class="main" data-act="metrics" id="metrics">Measure now</button>
-<button data-open="transition.html" id="opendash">Open dashboard</button><span class="note">Takes 1–2 minutes.</span></div></div></section>
+<button data-open="mix.html" id="opendash">Open dashboard</button><span class="note">Takes 1–2 minutes.</span></div></div></section>
 
 <section class="card"><div class="head"><div class="num">7</div><h2>Run it every day</h2><span class="badge" id="b7"></span></div>
 <div class="body"><div class="row"><label>Every day at <input type="time" id="at" value="20:00"></label>
 <button class="main" data-act="schedule" id="schedule">Turn on</button><button data-act="unschedule" id="unschedule">Turn off</button></div>
-<div class="note" id="schednote">The computer must be on (a Mac that was asleep runs it on wake).</div></div></section>
+<div class="note" id="schednote">The computer must be on (a Mac that was asleep runs it on wake). It keeps going every day until you turn it off.</div></div></section>
 </main>
 
 <div id="logbox"><div id="loghead"><b id="jobname">Output</b><span id="jobstate"></span><span style="margin-left:auto"></span>
@@ -434,15 +475,19 @@ let S=null,since=0,running=false;
 const badge=(id,txt,cls)=>{const b=$(id);b.textContent=txt;b.className='badge '+(cls||'')};
 const chk=(ok,txt,extra)=>`<li><span class="${ok?'y':'n'}">${ok?'✓':'✗'}</span> ${txt} ${extra||''}</li>`;
 
-function params(act){return {action:act,model:$('model').value,goal:$('goal').value,stages:+$('stages').value,days:+$('days').value,
+function params(act){return {action:act,model:$('model').value,topics:$('topics').value,days:+$('days').value,
  channels:[...document.querySelectorAll('.ch:checked')].map(x=>x.value),ais:[...document.querySelectorAll('.ai:checked')].map(x=>x.value),
- force:$('force').checked,at:$('at').value}}
-const AINAME={chatgpt:'ChatGPT',claude:'Claude',gemini:'Gemini'};let aisDrawn=false,sitesKey='';
+ force:$('force').checked,at:$('at').value,require:$('vpnreq').checked,auto:$('vpnauto').checked}}
+const AINAME={chatgpt:'ChatGPT',gemini:'Gemini'};let aisDrawn=false,vpnDrawn=false,paceDrawn=false,sitesKey='';
 function drawAIs(){ // drawn once per page load so the user's ticks are not reset by polling
  if(aisDrawn||!S)return;aisDrawn=true;const found={};(S.ais.found||[]).forEach(x=>found[x.id]=x);
  $('aichoice').innerHTML=S.ais.all.map(id=>{const f=found[id],how=f?f.how:(S.research?'run step 1 again to check':'do step 1 to check');
   return `<li><label><input type="checkbox" class="ai" value="${e(id)}" ${S.ais.chosen.includes(id)?'checked':''}> <b>${e(AINAME[id]||id)}</b></label> <span class="${f&&f.used?'y':'mut'}">${e(how)}</span></li>`}).join('');
  document.querySelectorAll('.ai').forEach(x=>x.onchange=render);
+}
+function drawVPN(){ // the same: ticked once from the saved settings
+ if(vpnDrawn||!S)return;vpnDrawn=true;$('vpnreq').checked=!!S.vpn.require;$('vpnauto').checked=!!S.vpn.auto_connect;
+ ['vpnreq','vpnauto'].forEach(id=>$(id).onchange=render);
 }
 function drawSites(R){ // Google and YouTube, plus the AIs the plan uses
  const ids=['google','youtube',...(R?R.ais:[])],key=ids.join();if(key===sitesKey)return;sitesKey=key;
@@ -474,49 +519,60 @@ async function poll(){
 }
 
 function render(){
- if(!S)return;const R=S.roadmap,busy=running;
+ if(!S)return;const R=S.roadmap,V=S.vpn,busy=running;
  const models=S.models,hasModel=m=>models.some(x=>x===m||x===m+':latest'||x.split(':')[0]===m.split(':')[0]&&m.indexOf(':')<0);
- const ready=S.playwright&&S.chrome&&S.ollama&&hasModel($('model').value||S.default_model)&&hasModel(S.embed_model);
+ drawVPN();
+ const vpnOk=!V.require||(!!V.cli&&(V.connected||V.auto_connect));
+ const ready=S.playwright&&S.chrome&&S.ollama&&hasModel($('model').value||S.default_model)&&hasModel(S.embed_model)&&vpnOk;
  $('checks').innerHTML=
   chk(true,S.frozen?'App (Python '+e(S.python)+' built in)':'Python '+e(S.python))+
   chk(S.playwright,'Browser helper (Playwright)',S.playwright||S.frozen?'':'<button data-act2="setup">Install</button>')+
   chk(S.chrome,'Google Chrome',S.chrome?'':'<a href="https://www.google.com/chrome/" target="_blank" rel="noopener">Download Chrome</a>')+
   chk(S.ollama,'Ollama is running',S.ollama?'':'<span class="mut">open the Ollama app, or</span> <a href="https://ollama.com/download" target="_blank" rel="noopener">download Ollama</a>')+
   (S.ollama?chk(hasModel($('model').value||S.default_model),'Model '+e($('model').value||S.default_model),hasModel($('model').value||S.default_model)?'':'<button data-act2="pull" data-m="'+e($('model').value||S.default_model)+'">Download</button>'):'')+
-  (S.ollama?chk(hasModel(S.embed_model),'Embedding model '+e(S.embed_model),hasModel(S.embed_model)?'':'<button data-act2="pull" data-m="'+e(S.embed_model)+'">Download</button>'):'');
+  (S.ollama?chk(hasModel(S.embed_model),'Embedding model '+e(S.embed_model),hasModel(S.embed_model)?'':'<button data-act2="pull" data-m="'+e(S.embed_model)+'">Download</button>'):'')+
+  chk(!!V.cli||!V.require,'NymVPN','<span class="mut">'+e(V.cli?V.state:(V.require?'nym-vpnc not found':'not used'))+'</span>'+(V.cli?'':' <a href="https://nym.com/download" target="_blank" rel="noopener">download NymVPN</a>'));
  document.querySelectorAll('[data-act2]').forEach(b=>{b.disabled=busy;b.onclick=async()=>{const p=params(b.dataset.act2);if(b.dataset.m)p.model=b.dataset.m;const r=await api('/api/start',p);if(r.error)alert(r.error);else{since=0;$('log').textContent='';poll()}}});
  badge('b0',ready?'ready':'needs attention',ready?'ok':'warn');
  $('modelnote').textContent=S.ollama?'':'Start Ollama to see your models.';
+ const vpnSaved=$('vpnreq').checked===!!V.require&&$('vpnauto').checked===!!V.auto_connect;
+ $('vpnauto').disabled=!$('vpnreq').checked;$('savevpn').disabled=busy||vpnSaved;
+ $('vpnnote').textContent=(!V.require?'Runs use your normal connection: Google and the AIs see your real IP address.':
+  !V.cli?V.howto:V.connected?'NymVPN is on; runs go through it.':
+  V.auto_connect?'NymVPN is off; a run turns it on first and off again after.':'NymVPN is off; turn it on in the NymVPN app before a run.')+(vpnSaved?'':' Not saved yet.');
 
  badge('b1',S.research?'done':'to do',S.research?'ok':'');
  $('research').disabled=busy||!ready||!$('consent').checked;$('openreport').disabled=!S.reports['report.html'];
 
+ $('suggested').innerHTML=S.suggested.length?S.suggested.map(t=>`<span>${e(t)}</span>`).join(''):'<span class="mut">none yet, do step 1</span>';
  $('plan').disabled=busy||!ready||!S.research;$('pace').disabled=busy||!R;
  drawAIs();drawSites(R);
  const picked=[...document.querySelectorAll('.ai:checked')].map(x=>x.value).sort().join(),planned=R?[...R.ais].sort().join():null;
  $('saveais').disabled=busy||!R||picked===planned;
  $('aisnote').textContent=!R?'Your choice is used when you make the plan.':(picked===planned?'The plan uses: '+(R.ais.map(x=>AINAME[x]).join(', ')||'no AIs'):'Not saved yet. Saving needs a new approval in step 3; progress is kept.');
- if(R){const sc=R.scores||{},P=sc.pos||[],f=x=>x==null?'–':(+x).toFixed(2);
+ if(R&&!paceDrawn){paceDrawn=true;$('days').value=R.days_per_topic}  // start from the plan's own pace
+ if(R){const sc=R.scores||{},f=x=>x==null?'–':(+x).toFixed(2),last=R.cards[R.cards.length-1];
   badge('b2',sc.valid?'plan passes all checks':'plan made, some checks missed',sc.valid?'ok':'warn');
-  $('plantable').innerHTML=`<table><tr><th>#</th><th>step</th><th>how it connects</th><th title="0 = you, 1 = your opposite">position</th></tr>`+
-   R.stages.map((s,i)=>`<tr><td>${e(s.k)}</td><td>${e(s.theme)}</td><td class="mut">${e(s.bridge)}</td><td>${f(P[i])}</td></tr>`).join('')+'</table>'+
-   `<div class="note">${e(R.stages.length)} steps × ${e(R.days_per_stage)} days = ${e(R.stages.length*R.days_per_stage)} days. `+
-   `Smoothness ${f(sc.min_cos)} (needs ≥ ${f((sc.cos_ends||0)+0.05)}), biggest jump ${f(sc.max_step)} (≤ ${f(sc.step_limit)}), steps back ${e(sc.backslides)}, goal reached ${Math.round((sc.coverage||0)*100)}%.</div>`;
- } else {badge('b2',S.research?'to do':'do step 1 first');$('plantable').innerHTML=''}
+  $('plantable').innerHTML=`<table><tr><th>#</th><th>topic</th><th>how it starts</th><th>joins on day</th><th title="how far the topic stays from your own interests">away</th></tr>`+
+   R.cards.map((c,i)=>`<tr><td>${e(c.k)}</td><td>${e(c.topic)}</td><td class="mut">${e(c.start)}</td><td>${e(c.joins)}</td><td>${f((sc.away||[])[i])}</td></tr>`).join('')+'</table>'+
+   `<div class="note">A new topic every ${e(R.days_per_topic)} days: all ${e(R.cards.length)} are live from day ${e(last?last.joins:1)}, then the mix keeps going every day. `+
+   `Away from you ${f(sc.min_away)} (needs ≥ 0.05), apart from each other ${f(sc.min_apart)} (needs ≥ 0.05), overlaps ${e(sc.overlaps)}, sensitive words ${e((sc.sensitive||[]).length)}.</div>`;
+ } else {badge('b2',S.research?'to do':'do step 1 first');$('plantable').innerHTML=S.roadmap_error?`<div class="note">${e(S.roadmap_error)}</div>`:''}
 
  badge('b3',R?(R.approved?'approved':'not approved'):'no plan yet',R&&R.approved?'ok':'');
  $('b3').title=R?'The plan talks to: '+(R.ais.map(x=>AINAME[x]).join(', ')||'Google and YouTube only'):'';
  $('approve').disabled=busy||!R||R.approved||!$('understood').checked;
 
  badge('b4','do once, and again if a run stops at a login page');
- $('login').disabled=busy||!S.playwright||!S.chrome;
+ $('login').disabled=busy||!S.playwright||!S.chrome||!vpnOk;
 
- if(R){const pct=R.days_total?Math.round(100*R.days_done/R.days_total):0;$('bar').style.width=pct+'%';
-  $('progress').textContent=R.next?`Day ${R.days_done+1} of ${R.days_total}: step ${R.next.stage}, day ${R.next.day}.`+(R.next.due_in_h>0?` Next day is due in ${R.next.due_in_h} h.`:' Ready to run.'):'All days are done.';
-  badge('b5',`${R.days_done}/${R.days_total} days`,R.next?'':'ok');
+ if(R){const n=R.cards.length,live=R.next.live.length;$('bar').style.width=Math.round(100*live/Math.max(n,1))+'%';
+  $('progress').textContent=`Day ${R.next.day}: ${R.next.live.join(', ')}. `+(R.next.due_in_h>0?`Due in ${R.next.due_in_h} h.`:'Ready to run.')+
+   (live<n?` ${live} of ${n} topics have joined.`:' All topics have joined.');
+  badge('b5',`${R.days_run} days run`,R.days_run?'ok':'');
  } else {$('progress').textContent='Make and approve a plan first.';badge('b5','waiting')}
- $('preview').disabled=busy||!R;$('run').disabled=busy||!R||!R.approved||!R.next||!S.playwright||!S.chrome;
- $('metrics').disabled=busy||!R||!S.ollama;$('opendash').disabled=!S.reports['transition.html'];badge('b6',S.reports['transition.html']?'dashboard ready':'');
+ $('preview').disabled=busy||!R;$('run').disabled=busy||!R||!R.approved||!S.playwright||!S.chrome||!vpnOk;
+ $('metrics').disabled=busy||!R||!S.ollama;$('opendash').disabled=!S.reports['mix.html'];badge('b6',S.reports['mix.html']?'dashboard ready':'');
 
  const on=S.scheduled;badge('b7',on==null?'not available here':(on?'on':'off'),on?'ok':'');
  $('schedule').disabled=busy||!R||!R.approved||on==null;$('unschedule').disabled=busy||!on;
@@ -536,21 +592,23 @@ refresh().then(poll);setInterval(()=>{if(!running)refresh()},5000);
 
 # ---------------------------------------------------------------- main
 def selftest():
-    args, stdin_text = build("plan", {"model": "qwen3:8b", "stages": "99", "days": "0", "goal": "  plants,\n gardening; rm -rf /  "})
-    assert args[args.index("--stages") + 1] == "20" and args[args.index("--days-per-stage") + 1] == "1"
-    assert args[-2:] == ["--goal", "plants, gardening; rm -rf /"] and stdin_text is None  # one argv item, never a shell
+    args, stdin_text = build("plan", {"model": "qwen3:8b", "days": "0", "topics": "  plants,\n gardening; rm -rf /  "})
+    assert args[args.index("--days-per-topic") + 1] == "1" and "--stages" not in args
+    assert args[-2:] == ["--topics", "plants, gardening; rm -rf /"] and stdin_text is None  # one argv item, never a shell
     for bad in ({"model": "x; rm -rf /"}, {"model": "--help"}):
         try:
             build("research", bad)
             raise AssertionError(f"accepted {bad}")
         except ValueError:
             pass
-    assert build("run", {"channels": ["google", "evil"]})[0][-2:] == ["--only", "google"]
-    assert build("ais", {"ais": ["gemini", "evil", "chatgpt"]})[0][-2:] == ["--set", "chatgpt,gemini"]
+    assert build("run", {"channels": ["google", "evil", "claude"]})[0][-2:] == ["--only", "google"]
+    assert build("ais", {"ais": ["gemini", "evil", "chatgpt", "claude"]})[0][-2:] == ["--set", "chatgpt,gemini"]
     assert build("ais", {"ais": []})[0][-1] == "none"
-    assert "--ais" in build("plan", {"ais": ["claude"]})[0]
+    assert "--ais" in build("plan", {"ais": ["gemini"]})[0]
     assert "--only" not in build("run", {"channels": list(CHANNELS)})[0]
     assert build("approve", {})[1] == "y"
+    assert build("vpn", {"require": True, "auto": "yes"})[0][-4:] == ["--require", "on", "--auto-connect", "off"]  # only true is true
+    assert build("pace", {"days": "99"})[0][-2:] == ["--days-per-topic", "30"]
     for bad_time in ("25:00", "8pm", "20:00; ls"):
         try:
             build("schedule", {"at": bad_time})
@@ -592,14 +650,14 @@ def selftest():
 def dispatch(argv):
     """`anti-persona --script NAME ...` runs one of our scripts inside the packaged app."""
     name, rest = argv[2], argv[3:]
-    if name not in ("persona", "anti", "browse"):
+    if name not in ("persona", "anti", "browse", "nym"):
         sys.exit(f"unknown script {name!r}")
     sys.argv = [f"{name}.py", *rest]
     if name == "browse":
         import browse
 
         return browse.main()
-    return {"persona": persona, "anti": anti}[name].main()
+    return {"persona": persona, "anti": anti, "nym": nym}[name].main()
 
 
 def ensure_streams():

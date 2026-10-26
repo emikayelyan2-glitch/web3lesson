@@ -8,10 +8,17 @@ summary.json
 persona.json
 report.html
 transition.html
+mix.html
 roadmap*.json
+days.json
+settings.json
 log.jsonl
 metrics.jsonl
 launchd.log
+
+# NymVPN's command-line client, dropped next to the code (a binary, never commit it)
+nym-vpnc
+nym-vpnc.exe
 
 # AI chat exports people drop next to the code (ChatGPT export, etc.)
 conversations.json

@@ -4,7 +4,7 @@
     python3 browse.py google  "query"  [--fast]
     python3 browse.py youtube "query"  [--fast]
     python3 browse.py chatgpt "prompt" [--fast]
-    python3 browse.py claude  "prompt" [--fast]
+    python3 browse.py gemini  "prompt" [--fast]
 
 Runs in its own profile (~/.anti/profile), always visible. Login walls and bot
 checks stop the run: they are never solved, bypassed or retried through.
@@ -30,14 +30,40 @@ class Busy(Exception):
     """Another run is using the profile right now (a manual run while the scheduler fires, or vice versa)."""
 
 
+def alive(pid):
+    """Is this process running? On Windows os.kill(pid, 0) sends Ctrl+C instead of checking, so ask Windows."""
+    if not 0 < pid < 2**32:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32")  # a private handle: the argtypes below do not leak into other code
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        k.CloseHandle.argtypes = (wintypes.HANDLE,)
+        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = wintypes.DWORD()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def acquire_lock():
     """Chrome corrupts a profile opened twice; clearing SingletonLock below is only safe if no run is alive."""
     try:
         pid = int(LOCK.read_text())
-        os.kill(pid, 0)
     except (OSError, ValueError):
-        pass  # no lock, unreadable, or the process is gone
-    else:
+        pid = None  # no lock, or unreadable
+    if pid and pid != os.getpid() and alive(pid):
         raise Busy(f"another run (pid {pid}) holds {PROFILE}; wait for it or stop it")
     LOCK.write_text(str(os.getpid()))
 
@@ -57,12 +83,6 @@ SEL = {
         "box": "rich-textarea div[contenteditable='true'], div.ql-editor[contenteditable='true']",
         "stop": "button[aria-label*='Stop']",
         "reply": "model-response message-content",
-    },
-    "claude": {
-        "url": "https://claude.ai/new",
-        "box": "div[contenteditable='true']",
-        "stop": "[data-is-streaming='true']",
-        "reply": "[data-is-streaming='false']",
     },
 }
 STOP = re.compile(
@@ -84,7 +104,7 @@ def pause(lo, hi, fast=False):
 def session(close_popups=True):
     PROFILE.mkdir(parents=True, exist_ok=True)
     for d in (PROFILE.parent, PROFILE):
-        d.chmod(0o700)  # holds Google/OpenAI/Anthropic cookies
+        d.chmod(0o700)  # holds Google and OpenAI cookies
     acquire_lock()
     for f in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         (PROFILE / f).unlink(missing_ok=True)  # stale after a crash; safe because the lock above proved no run is alive
@@ -204,7 +224,6 @@ CHANNELS = {
     "google": google,
     "youtube": youtube,
     "chatgpt": lambda page, text, fast=False: chat(page, "chatgpt", text, fast),
-    "claude": lambda page, text, fast=False: chat(page, "claude", text, fast),
     "gemini": lambda page, text, fast=False: chat(page, "gemini", text, fast),
 }
 
